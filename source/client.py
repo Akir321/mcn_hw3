@@ -205,4 +205,4 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
-    run_client(args.server, args.session, args.name, args.port, args.bind_ip)
+    run_client(args.server, args.session, args.name, args.bind_port, args.bind_ip)
