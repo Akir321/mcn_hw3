@@ -1,18 +1,18 @@
 import argparse
+import errno
 import json
 import signal
 import socket
 import sys
 import threading
 import time
-from collections import deque
 
-PEER_WAIT_TIMEOUT = 20.0
-PUNCH_INTERVAL = 0.2
-PUNCH_TIMEOUT = 15.0
-KEEPALIVE_INTERVAL = 20.0
-RECV_TIMEOUT = 0.5
-MAX_DATAGRAM_SIZE = 4096
+PEER_WAIT_TIMEOUT   = 20.0
+PUNCH_INTERVAL      = 0.2
+PUNCH_TIMEOUT       = 15.0
+KEEPALIVE_INTERVAL  = 20.0
+RECV_TIMEOUT        = 0.5
+MAX_DATAGRAM_SIZE   = 4096
 
 def parse_server(addr_str):
     ip, port = addr_str.split(":")
@@ -21,10 +21,13 @@ def parse_server(addr_str):
 
 def detect_local_ip_for_peer(server_addr):
     temp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    temp.connect(server_addr)
-    local_ip = temp.getsockname()[0]
-    temp.close()
-    return local_ip
+    try:
+        temp.connect(server_addr)
+        return temp.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        temp.close()
 
 
 def create_bound_socket(bind_ip, bind_port):
@@ -38,29 +41,45 @@ def send_register(sock, server, session, name):
     local = sock.getsockname()
     private = [local[0], local[1]]
     msg = {"type": "REGISTER", "session": session, "name": name, "private": private}
-    sock.sendto(json.dumps(msg).encode(), server)
-    print(f"[local={local}] Sent REGISTER to {server}")
+    try:
+        sock.sendto(json.dumps(msg).encode(), server)
+    except OSError as e:
+        print(f"[WARN] REGISTER send failed: {e}")
+    else:
+        print(f"[local={local}] Sent REGISTER to {server}")
 
 
 def send_keepalive_loop(sock, server, session, name, stop_event):
     while not stop_event.wait(KEEPALIVE_INTERVAL):
         msg = {"type": "KEEPALIVE", "session": session, "name": name}
-        sock.sendto(json.dumps(msg).encode(), server)
-           
+        try:
+            sock.sendto(json.dumps(msg).encode(), server)
+        except OSError as e:
+            if e.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EHOSTDOWN):
+                print(f"[WARN] KEEPALIVE failed: {e}")
+                
 
 def wait_for_peer_info(sock, server, timeout=PEER_WAIT_TIMEOUT):
     end_time = time.time() + timeout
     while time.time() < end_time:
-        data, addr = sock.recvfrom(MAX_DATAGRAM_SIZE)
-    
+        try:
+            data, addr = sock.recvfrom(MAX_DATAGRAM_SIZE)
+        except OSError as e:
+            print(f"[WARN] recv error while waiting PEER: {e}")
+            continue
+
         if addr != server:
             continue
-        
-        msg = json.loads(data.decode())
-       
-        if msg.get("type") == "PEER":
+
+        try:
+            msg = json.loads(data.decode())
+        except Exception:
+            continue
+
+        t = msg.get("type")
+        if t == "PEER":
             return msg["peer"]
-        if msg.get("type") == "WAIT":
+        if t == "WAIT":
             print("Server:", msg.get("msg"))
     return None
 
@@ -87,8 +106,10 @@ def punch_and_establish_connection(sock, peer_info, connected_event, peer_addr_h
             else:
                 send_msg = b"__punch__"
             for c in candidates:
-                sock.sendto(send_msg, c)
-            
+                try:
+                    sock.sendto(send_msg, c)
+                except OSError as e:
+                    print(f"[WARN] sendto({c}) failed: {e}")
         try:
             data, addr = sock.recvfrom(MAX_DATAGRAM_SIZE)
         except Exception:
@@ -120,8 +141,10 @@ def stdin_reader_thread(stop_event, connected_event, peer_addr_holder, sock):
         if not text:
             continue
         if connected_event.is_set() and peer_addr_holder.get('addr'):
-            sock.sendto(text.encode(), peer_addr_holder['addr'])
-            
+            try:
+                sock.sendto(text.encode(), peer_addr_holder['addr'])
+            except OSError as e:
+                print(f"[WARN] send user msg failed: {e}")
         else:
             print("Connection not yet established.")
 
@@ -150,13 +173,15 @@ def run_client(server_str, session, name, port=None, bind_ip=None):
 
     stop_event = threading.Event()
 
-    def _signal_handler(sig, frame):
-        print("Signal " + sig +" received, shutting down...")
+    def _signal_handler(sig, _frame):
+        print(f"Signal {sig} received, shutting down...")
         stop_event.set()
-        sock.close()
-        sys.exit(0)
+        try:
+            sock.close()
+        finally:
+            sys.exit(0)
 
-    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGINT,  _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
     send_register(sock, server, session, name)
@@ -164,12 +189,14 @@ def run_client(server_str, session, name, port=None, bind_ip=None):
     ka_thread = threading.Thread(target=send_keepalive_loop, args=(sock, server, session, name, stop_event), daemon=True)
     ka_thread.start()
 
-    peer_info = wait_for_peer_info(sock, server)
+    peer_info = wait_for_peer_info(sock, server, timeout=PEER_WAIT_TIMEOUT)
     if not peer_info:
         print("No peer info received from rendezvous within timeout. Exiting.")
         stop_event.set()
-        sock.close()
-        return
+        try:
+            sock.close()
+        finally:
+            return
 
     connected_event = threading.Event()
     peer_addr_holder = {'addr': None}
@@ -184,14 +211,18 @@ def run_client(server_str, session, name, port=None, bind_ip=None):
         print("Connected to peer:", peer_addr_holder['addr'])
 
         input_thread.start()
-        chat_receive_loop(sock, stop_event, server)
-        
+        try:
+            chat_receive_loop(sock, stop_event, server)
+        except KeyboardInterrupt:
+            pass
     else:
         print("No direct connection established; exiting.")
 
     stop_event.set()
-    sock.close()
-
+    try:
+        sock.close()
+    except Exception:
+        pass
 
 def parse_args():
     p = argparse.ArgumentParser()
